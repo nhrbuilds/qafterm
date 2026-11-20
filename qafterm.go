@@ -45,6 +45,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
@@ -98,6 +99,8 @@ type Session struct {
 	rows int
 	// palette maps the emulator's palette colors to their indexes.
 	palette map[uint32]int
+	// modes holds the terminal modes the program enabled.
+	modes map[ansi.Mode]bool
 
 	closeOnce sync.Once
 }
@@ -149,6 +152,7 @@ func Start(cfg Config) (*Session, error) {
 		done:   make(chan struct{}),
 		closed: make(chan struct{}),
 		rows:   rows,
+		modes:  map[ansi.Mode]bool{},
 	}
 	s.emu.SetScrollbackSize(history)
 	s.emu.SetCallbacks(vt.Callbacks{
@@ -156,6 +160,8 @@ func Start(cfg Config) (*Session, error) {
 		Title:            func(t string) { s.mu.Lock(); s.title = t; s.mu.Unlock() },
 		AltScreen:        func(on bool) { s.mu.Lock(); s.alt = on; s.mu.Unlock() },
 		WorkingDirectory: func(dir string) { s.mu.Lock(); s.cwd = dir; s.mu.Unlock() },
+		EnableMode:       func(m ansi.Mode) { s.setMode(m, true) },
+		DisableMode:      func(m ansi.Mode) { s.setMode(m, false) },
 	})
 	go s.pumpOutput()
 	go s.pumpInput()
@@ -336,6 +342,46 @@ func (s *Session) WorkingDir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cwd
+}
+
+// setMode records a terminal mode change.
+func (s *Session) setMode(m ansi.Mode, on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modes == nil {
+		s.modes = map[ansi.Mode]bool{}
+	}
+	s.modes[m] = on
+}
+
+// Cursor returns the cursor position in cells and whether the cursor is
+// hidden (the program asked for it to be invisible).
+func (s *Session) Cursor() (x, y int, hidden bool) {
+	pos := s.emu.CursorPosition()
+	return pos.X, pos.Y, s.emu.CursorHidden()
+}
+
+// MouseEnabled reports whether the program asked for mouse reports. Hosts
+// must not forward mouse events while this is false: the program would
+// receive reports it never asked for.
+func (s *Session) MouseEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range []ansi.Mode{
+		ansi.ModeMouseNormal, ansi.ModeMouseButtonEvent, ansi.ModeMouseAnyEvent,
+	} {
+		if s.modes[m] {
+			return true
+		}
+	}
+	return false
+}
+
+// BracketedPaste reports whether the program enabled bracketed paste.
+func (s *Session) BracketedPaste() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.modes[ansi.ModeBracketedPaste]
 }
 
 // ScrollbackLen reports how many history lines are buffered.
