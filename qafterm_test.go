@@ -303,3 +303,76 @@ func filepathBase(p string) string {
 	}
 	return p
 }
+
+// TestCloseRacesWithPumps pins the shutdown contract under -race: closing a
+// session while both pumps are live (output flowing, input pump parked) must
+// not race inside the emulator. vt v0.1.0 leaves Emulator.Read/Close
+// unserialized, so Close used to race the input pump's Read on the emulator's
+// closed flag; the input pump now owns the shutdown instead.
+func TestCloseRacesWithPumps(t *testing.T) {
+	if _, err := os.Stat("/dev/ptmx"); os.IsNotExist(err) {
+		t.Skip("no pty device")
+	}
+	for i := 0; i < 8; i++ {
+		ses, err := Start(Config{Shell: "sh", Args: []string{"-c", "while true; do echo spam; sleep 0.01; done"}, Cols: 60, Rows: 12})
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		// Let both pumps spin up and some output flow, then close while the
+		// input pump is most likely parked in Read.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if strings.Contains(screenText(ses), "spam") {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		done := make(chan error, 1)
+		go func() { done <- ses.Close() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("close: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return within 5s (deadlock?)")
+		}
+		// The session must report exit promptly after Close.
+		select {
+		case <-ses.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("Done not closed after Close (deadlock?)")
+		}
+	}
+}
+
+// TestInputAfterCloseRejected pins that host input after (or during) Close is
+// a harmless no-op rather than a write into a dead pipe that can block.
+func TestInputAfterCloseRejected(t *testing.T) {
+	if _, err := os.Stat("/dev/ptmx"); os.IsNotExist(err) {
+		t.Skip("no pty device")
+	}
+	ses, err := Start(Config{Shell: "sh", Args: []string{"-c", "sleep 30"}, Cols: 40, Rows: 6})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := ses.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// These must return promptly (no pipe-write hang).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ses.Key(KeyEvent{Code: 'a', Text: "a"})
+		_ = ses.Text("hello")
+		_ = ses.Paste("hello")
+		ses.Focus()
+		ses.Blur()
+		_ = ses.Resize(20, 5)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("input after Close blocked")
+	}
+}

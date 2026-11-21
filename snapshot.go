@@ -71,7 +71,14 @@ type Cell struct {
 type Row []Cell
 
 // Snapshot returns the current viewport: the visible screen rows.
+//
+// The walk holds emuMu for its whole duration: CellAt and Scrollback hand
+// out pointers into the emulator's live buffer memory, so reading their
+// fields must exclude the output pump's Write (which mutates those cells).
+// emuMu is always taken before s.mu — the same order the pump uses.
 func (s *Session) Snapshot() []Row {
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.screenRows()
@@ -82,6 +89,8 @@ func (s *Session) Snapshot() []Row {
 // the screen with history lines. The result always has the terminal's
 // height.
 func (s *Session) View(scroll int) []Row {
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	height := s.emu.Height()
@@ -115,6 +124,8 @@ func (s *Session) View(scroll int) []Row {
 // Snapshot or View. The returned indices are relative to the visible screen;
 // a scrolled viewport should be repainted in full.
 func (s *Session) Damage() []int {
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows := s.screenRows()

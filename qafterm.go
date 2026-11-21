@@ -44,6 +44,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
@@ -87,6 +89,14 @@ type Session struct {
 	cmd    *exec.Cmd
 	done   chan struct{}
 	closed chan struct{}
+
+	// emuMu serializes every emulator access that can run concurrently with
+	// the shutdown below (pump writes, host input, resize). The input pump's
+	// Read stays outside: its goroutine owns the shutdown, so Read can never
+	// overlap Emulator.Close by construction.
+	emuMu sync.Mutex
+	// closing is set by Close; input methods no-op afterwards.
+	closing atomic.Bool
 
 	title string
 	bell  bool
@@ -248,7 +258,9 @@ func (s *Session) pumpOutput() {
 	for {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
+			s.emuMu.Lock()
 			_, _ = s.emu.Write(buf[:n])
+			s.emuMu.Unlock()
 		}
 		if err != nil {
 			return
@@ -257,18 +269,44 @@ func (s *Session) pumpOutput() {
 }
 
 // pumpInput moves bytes the emulator produced (key presses, mouse reports)
-// back to the shell.
+// back to the shell. This goroutine also owns the emulator shutdown: Close
+// only wakes the loop, so Emulator.Read and Emulator.Close can never run
+// concurrently. vt v0.1.0 leaves both unserialized (SafeEmulator.Read does
+// not lock, and Close is promoted unlocked from the embedded emulator),
+// which raced on the emulator's closed flag and failed the host's -race
+// build.
 func (s *Session) pumpInput() {
 	defer close(s.closed)
+	defer func() {
+		s.emuMu.Lock()
+		_ = s.emu.Close()
+		s.emuMu.Unlock()
+	}()
 	buf := make([]byte, 256)
 	for {
+		// The only exit: shutting down AND the output pump finished. Staying
+		// in the loop keeps draining the emulator's input pipe, which the
+		// output pump may still block on — replies it writes back to the
+		// shell go through an io.Pipe that is synchronous with this reader.
+		if s.closing.Load() {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+		}
 		n, err := s.emu.Read(buf)
 		if n > 0 {
 			if _, werr := s.ptmx.Write(buf[:n]); werr != nil {
-				return
+				// PTY gone (Close). Keep looping: Close sends its wake byte
+				// only after the output pump has exited, so the loop wakes
+				// up to observe done and return.
+				continue
 			}
 		}
 		if err != nil {
+			// The emulator input pipe only closes in our own deferred
+			// shutdown — unreachable before that; bail out for safety.
 			return
 		}
 	}
@@ -277,15 +315,37 @@ func (s *Session) pumpInput() {
 // Done is closed when the shell exits.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
-// Close terminates the session and releases the pseudo-terminal.
+// Close terminates the session and releases the pseudo-terminal. The
+// emulator itself is shut down by the input pump (see pumpInput); Close
+// kills the shell, closes the PTY, waits for the output pump, and then
+// wakes the input pump so nothing stays parked.
 func (s *Session) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
-		_ = s.emu.Close() // unblocks the input pump
+		s.closing.Store(true)
 		if s.cmd != nil && s.cmd.Process != nil {
 			_ = s.cmd.Process.Kill()
 		}
 		err = s.ptmx.Close()
+		// The output pump stops once the PTY is closed (a reply it is still
+		// writing keeps draining through the input pump's loop above). Wait
+		// for it BEFORE the wake byte: then the input pump's very next loop
+		// iteration sees closing AND done and returns — it can never re-park
+		// past the shutdown.
+		select {
+		case <-s.done:
+		case <-time.After(2 * time.Second): // never hang on a wedged pump
+		}
+		// Wake the input pump if it is parked in Read (a silent shell): one
+		// byte arrives, the loop observes closing + done and exits. The
+		// byte is harmless — the PTY is already closed.
+		s.emuMu.Lock()
+		s.emu.SendText("\n")
+		s.emuMu.Unlock()
+		select {
+		case <-s.closed:
+		case <-time.After(2 * time.Second): // never hang on a wedged pump
+		}
 	})
 	return err
 }
@@ -298,12 +358,23 @@ func (s *Session) Resize(cols, rows int) error {
 	if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}); err != nil {
 		return err
 	}
-	s.emu.Resize(cols, rows)
+	s.sendInput(func() { s.emu.Resize(cols, rows) })
 	s.mu.Lock()
 	s.rows = rows
 	s.hashes = nil
 	s.mu.Unlock()
 	return nil
+}
+
+// sendInput guards one host-side emulator call: rejected once Close has
+// begun, serialized against the pump-owned emulator shutdown.
+func (s *Session) sendInput(fn func()) {
+	if s.closing.Load() {
+		return
+	}
+	s.emuMu.Lock()
+	defer s.emuMu.Unlock()
+	fn()
 }
 
 // Cols and Rows report the current terminal size.
@@ -399,35 +470,35 @@ func (s *Session) MaxScrollback() int {
 // Key sends a key press to the shell. Special keys use the Key* constants;
 // printable keys use their rune.
 func (s *Session) Key(k KeyEvent) error {
-	s.emu.SendKey(k.toVT())
+	s.sendInput(func() { s.emu.SendKey(k.toVT()) })
 	return nil
 }
 
 // Text sends literal text to the shell (typing, pasting).
 func (s *Session) Text(text string) error {
-	s.emu.SendText(text)
+	s.sendInput(func() { s.emu.SendText(text) })
 	return nil
 }
 
 // Paste sends text to the shell using bracketed paste when the program
 // enabled the mode.
 func (s *Session) Paste(text string) error {
-	s.emu.Paste(text)
+	s.sendInput(func() { s.emu.Paste(text) })
 	return nil
 }
 
 // Mouse sends a mouse event to the shell. It is ignored unless the program
 // enabled mouse reporting.
 func (s *Session) Mouse(ev MouseEvent) error {
-	s.emu.SendMouse(ev.toVT())
+	s.sendInput(func() { s.emu.SendMouse(ev.toVT()) })
 	return nil
 }
 
 // Focus tells the shell the terminal gained focus (mode 1004).
-func (s *Session) Focus() { s.emu.Focus() }
+func (s *Session) Focus() { s.sendInput(func() { s.emu.Focus() }) }
 
 // Blur tells the shell the terminal lost focus (mode 1004).
-func (s *Session) Blur() { s.emu.Blur() }
+func (s *Session) Blur() { s.sendInput(func() { s.emu.Blur() }) }
 
 // ShellName returns a short display name for the shell (for example "zsh"),
 // suitable for a tab title.
