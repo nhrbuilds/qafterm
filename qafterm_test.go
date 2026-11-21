@@ -376,3 +376,43 @@ func TestInputAfterCloseRejected(t *testing.T) {
 		t.Fatal("input after Close blocked")
 	}
 }
+
+// TestCloseShake hammers Close across many interleavings: closing while the
+// input pump is parked in Read, already out of its loop (the CI deadlock's
+// winning race — pump heads into its deferred emu.Close while Close sends
+// the wake byte), and closing instantly-exiting shells. Each cycle must end
+// promptly with the pump fully drained, under -race as well.
+func TestCloseShake(t *testing.T) {
+	if _, err := os.Stat("/dev/ptmx"); os.IsNotExist(err) {
+		t.Skip("no pty device")
+	}
+	scripts := []string{
+		"while true; do sleep 30; done", // silent shell: pump parked in Read
+		"echo hi; sleep 30",             // quiet after one burst
+		"true",                          // already exited: done fires during Close
+		"while true; do echo spam; sleep 0.005; done", // busy output pump
+	}
+	for i := 0; i < 24; i++ {
+		ses, err := Start(Config{Shell: "sh", Args: []string{"-c", scripts[i%len(scripts)]}, Cols: 40, Rows: 6})
+		if err != nil {
+			t.Fatalf("cycle %d: start: %v", i, err)
+		}
+		if i%3 == 0 {
+			// Input racing Close: exercises the lock-free wake byte against
+			// in-flight user sends.
+			_ = ses.Text("echo hi\n")
+		}
+		closed := make(chan struct{})
+		go func() { defer close(closed); _ = ses.Close() }()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("cycle %d: Close did not return within 5s (deadlock?)", i)
+		}
+		select {
+		case <-ses.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("cycle %d: Done not closed after Close (deadlock?)", i)
+		}
+	}
+}

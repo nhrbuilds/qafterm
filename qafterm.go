@@ -338,10 +338,14 @@ func (s *Session) Close() error {
 		}
 		// Wake the input pump if it is parked in Read (a silent shell): one
 		// byte arrives, the loop observes closing + done and exits. The
-		// byte is harmless — the PTY is already closed.
-		s.emuMu.Lock()
+		// byte is harmless — the PTY is already closed. SendText goes
+		// through a synchronous io.Pipe, so it must NOT hold emuMu:
+		// pumpInput's deferred emu.Close() is what unblocks this write when
+		// the pump has already left its loop, and that teardown needs this
+		// mutex. Holding it here deadlocked Close against the pump (CI).
+		// The pipe itself is internally synchronized, so a lock-free write
+		// is safe.
 		s.emu.SendText("\n")
-		s.emuMu.Unlock()
 		select {
 		case <-s.closed:
 		case <-time.After(2 * time.Second): // never hang on a wedged pump
